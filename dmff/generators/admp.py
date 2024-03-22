@@ -1180,14 +1180,21 @@ class ADMPPmeGenerator:
         map_poltype = np.zeros(n_atoms, dtype=int)
 
         atoms = [a for a in topdata.atoms()]
-        for i in range(n_atoms):
-            atype = atoms[i].meta[
-                self.key_type
-            ]  # convert str to int to match atomTypes
-            map_atomtype[i] = self._find_multipole_key_index(atype)
-            if self.lpol:
-                map_poltype[i] = self._find_polarize_key_index(atype)
-
+        try:
+            for i in range(n_atoms):
+                atype = atoms[i].meta[
+                    self.key_type
+                ]  # convert str to int to match atomTypes
+                map_atomtype[i] = self._find_multipole_key_index(atype)
+                if self.lpol:
+                    map_poltype[i] = self._find_polarize_key_index(atype)
+        except:
+            # no bonding case
+            type_map = kwargs["type_map"]
+            for i in range(n_atoms):
+                atype = atoms[i].meta["element"]
+                # find the index of atype in type_map
+                map_atomtype[i] = type_map.index(atype)
 
         # here box is only used to setup ewald parameters, no need to be differentiable
         box = topdata.getPeriodicBoxVectors()
