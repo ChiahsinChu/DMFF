@@ -25,10 +25,13 @@ jobs:
           pip install jax==0.4.24 jaxlib==0.4.24 jaxopt networkx parmed pymbar==4.0.1 optax tqdm
       - name: Install DMFF
         run: |
-          source $CONDA/bin/activate dmff && pip install .
+          source $CONDA/bin/activate
+          conda activate dmff
+          pip install .
       - name: Run Tests
         run: |
-          source $CONDA/bin/activate dmff
+          source $CONDA/bin/activate
+          conda activate dmff
           pytest -vs tests/test_classical/test_*
           pytest -vs tests/test_common/test_*
           pytest -vs tests/test_admp/test_*
