@@ -23,6 +23,7 @@ DOI: 10.1021/acs.jctc.2c01297`
   + [Classical](./user_guide/4.1classical.md)
   + [ADMP](./user_guide/4.2ADMPPmeForce.md)
   + [Qeq](./user_guide/4.3ADMPQeqForce.md)
+  + [Polarizable Electrode](./user_guide/4.11PolarizableElectrode.md)
   + [Machine Learning](./user_guide/4.4MLForce.md)
   + [Optimization](./user_guide/4.5Optimization.md)
   + [Mbar Estimator](./user_guide/4.6MBAR.md)

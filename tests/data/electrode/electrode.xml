@@ -1,0 +1,8 @@
+<ForceField>
+ <AtomTypes>
+  <Type name="Pt" class="Pt" element="Pt" mass="195.084"/>
+ </AtomTypes>
+ <ADMPPolarizableElectrodeForce>
+  <Atom type="Pt" chi="0.0" J="0.0" eta="0.625"/>
+ </ADMPPolarizableElectrodeForce>
+</ForceField>
