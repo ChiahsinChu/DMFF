@@ -191,16 +191,50 @@ def test_setup_errors():
         setup_from_lammps(
             10, [LAMMPSElectrodeConstraint(np.arange(5), "conq", 0.0, ETA_LMP)], True
         )
-    with pytest.raises(AttributeError, match="ffield with conq"):
-        setup_from_lammps(
-            10,
-            [LAMMPSElectrodeConstraint(np.arange(5), "conq", 0.0, ETA_LMP, ffield=True)],
-        )
     with pytest.raises(AttributeError, match="number of ffield group"):
         setup_from_lammps(
             10,
             [LAMMPSElectrodeConstraint(np.arange(5), "conp", 0.0, ETA_LMP, ffield=True)],
         )
+    with pytest.raises(AttributeError, match="same mode"):
+        setup_from_lammps(
+            10,
+            [
+                LAMMPSElectrodeConstraint(np.arange(5), "conp", 0.0, ETA_LMP, ffield=True),
+                LAMMPSElectrodeConstraint(
+                    np.arange(5, 10), "conq", 0.0, ETA_LMP, ffield=True
+                ),
+            ],
+        )
+
+
+def test_conq_ffield_vs_lammps():
+    """conq + finite field: group potentials solved self-consistently."""
+    name = "lmp_conq_interface_3d_bias"
+    constraints = [
+        LAMMPSElectrodeConstraint(BOTTOM, "conq", -10.0, ETA_LMP, ffield=True),
+        LAMMPSElectrodeConstraint(TOP, "conq", 10.0, ETA_LMP, ffield=True),
+    ]
+    positions, box, pairs, ref_q, ref_forces = load_case(name, False)
+    n = positions.shape[0]
+
+    setup = setup_from_lammps(n, constraints)
+    calc = PolarizableElectrode(
+        rcut=RCUT, box=np.array(box), ethresh=ETHRESH, kappa=KAPPA
+    )
+    charges = ref_q.at[setup.elec_idx].set(0.0)
+
+    energy, forces, q_opt = infer(
+        calc, positions, box, charges, pairs, setup, method="matinv"
+    )
+    np.testing.assert_allclose(
+        np.array(forces) / EV2KJ, ref_forces, atol=5e-4, rtol=5e-4
+    )
+    np.testing.assert_allclose(np.array(q_opt), np.array(ref_q), atol=1e-3)
+
+    # the iterative solver does not support the coupled system
+    with pytest.raises(NotImplementedError, match="matinv"):
+        infer(calc, positions, box, charges, pairs, setup, method="lbfgs")
 
 
 def test_ffield_slab_corr_error():

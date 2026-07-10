@@ -92,7 +92,9 @@ class ElectrodeSetup(NamedTuple):
     constraint_matrix: jnp.ndarray  # (n_const, n_electrode)
     constraint_vals: jnp.ndarray  # (n_const,) [e]
     ffield_electrode_mask: Optional[jnp.ndarray]  # (2, n_atoms) bool
-    ffield_potential: Optional[jnp.ndarray]  # (2,) [kJ/mol/e]
+    ffield_potential: Optional[jnp.ndarray]  # (2,) [kJ/mol/e], conp only
+    ffield_conq: bool = False  # potentials are unknowns (conq groups)
+    ffield_const_rows: Optional[np.ndarray] = None  # (2,) constraint rows, static
 
 
 def setup_from_lammps(
@@ -117,6 +119,8 @@ def setup_from_lammps(
     constraint_vals = []
     ffield_electrode_mask = []
     ffield_potential = []
+    ffield_modes = []
+    ffield_const_rows = []
 
     for constraint in constraint_list:
         mask[constraint.indices] = True
@@ -131,7 +135,9 @@ def setup_from_lammps(
                     "symm should be False for conq, user can implement symm by conq"
                 )
             if constraint.ffield:
-                raise AttributeError("ffield with conq has not been implemented yet")
+                # the group potential is the (negative) Lagrange multiplier
+                # of this constraint row
+                ffield_const_rows.append(len(constraint_matrix))
             constraint_matrix.append(np.zeros((1, n_atoms)))
             constraint_matrix[-1][0, constraint.indices] = 1.0
             constraint_vals.append(constraint.value)
@@ -140,16 +146,25 @@ def setup_from_lammps(
         if constraint.ffield:
             ffield_electrode_mask.append(np.zeros((1, n_atoms)))
             ffield_electrode_mask[-1][0, constraint.indices] = 1.0
-            ffield_potential.append(constraint.value * EV2KJ)
+            ffield_potential.append(
+                constraint.value * EV2KJ if constraint.mode == "conp" else 0.0
+            )
+            ffield_modes.append(constraint.mode)
 
+    ffield_conq = False
     if len(ffield_electrode_mask) == 0:
         ffield_electrode_mask = None
         ffield_potential = None
+        ffield_const_rows = None
     elif len(ffield_electrode_mask) == 2:
+        if ffield_modes[0] != ffield_modes[1]:
+            raise AttributeError("ffield groups must have the same mode")
+        ffield_conq = ffield_modes[0] == "conq"
         ffield_electrode_mask = jnp.array(
             np.concatenate(ffield_electrode_mask, axis=0), dtype=bool
         )
         ffield_potential = jnp.array(np.array(ffield_potential))
+        ffield_const_rows = np.array(ffield_const_rows) if ffield_conq else None
     else:
         raise AttributeError("number of ffield group should be 0 or 2")
 
@@ -177,6 +192,8 @@ def setup_from_lammps(
         constraint_vals=constraint_vals,
         ffield_electrode_mask=ffield_electrode_mask,
         ffield_potential=ffield_potential,
+        ffield_conq=ffield_conq,
+        ffield_const_rows=ffield_const_rows,
     )
 
 
@@ -202,27 +219,36 @@ def finite_field_add_chi(
     assert ffield_electrode_mask.shape[0] == 2
     assert ffield_electrode_mask.shape[1] == positions.shape[0]
 
-    first_electrode_mask = ffield_electrode_mask[0]
-    second_electrode_mask = ffield_electrode_mask[1]
-
     potential_drop = ffield_potential[0] - ffield_potential[1]
-
-    # find max position in slab_axis for each electrode
-    max_pos_first = jnp.max(
-        jnp.where(first_electrode_mask, positions[:, slab_axis], -jnp.inf)
-    )
-    max_pos_second = jnp.max(
-        jnp.where(second_electrode_mask, positions[:, slab_axis], -jnp.inf)
-    )
-    # only valid for orthogonality cell
-    lz = box[slab_axis][slab_axis]
+    sign, lz = ffield_sign_lz(positions, box, ffield_electrode_mask, slab_axis)
     normalized_positions = positions[:, slab_axis] / lz
     # lammps fix electrode implementation
     # cos180(-1) or cos0(1) for E(delta_psi/(r1-r2)) and r
-    sign = jnp.where(max_pos_first > max_pos_second, 1.0, -1.0)
     potential = potential_drop * sign * normalized_positions
     efield = -sign * potential_drop / lz
     return potential, efield
+
+
+def ffield_sign_lz(
+    positions: jnp.ndarray,
+    box: jnp.ndarray,
+    ffield_electrode_mask: jnp.ndarray,
+    slab_axis: int = 2,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Field direction sign and box length for the finite-field setup.
+
+    sign is +1 when the first electrode group lies above the second one
+    along slab_axis; only valid for orthogonal cells.
+    """
+    max_pos_first = jnp.max(
+        jnp.where(ffield_electrode_mask[0], positions[:, slab_axis], -jnp.inf)
+    )
+    max_pos_second = jnp.max(
+        jnp.where(ffield_electrode_mask[1], positions[:, slab_axis], -jnp.inf)
+    )
+    sign = jnp.where(max_pos_first > max_pos_second, 1.0, -1.0)
+    lz = box[slab_axis][slab_axis]
+    return sign, lz
 
 
 class PolarizableElectrode:
@@ -450,7 +476,26 @@ def charge_optimization(
     )
     chi = (setup.chi + chi_elec)[elec_idx]
 
-    if setup.ffield_electrode_mask is not None:
+    ffield_f = None
+    ffield_c = None
+    if setup.ffield_electrode_mask is not None and setup.ffield_conq:
+        # conq + finite field: the group potentials are unknowns (the
+        # negative Lagrange multipliers of the charge constraints), so the
+        # potential ramp couples charges and multipliers in the KKT system:
+        # chi_ffield_i = -(lambda_A - lambda_B) * f_i with f = sign * z / lz
+        if method != "matinv":
+            raise NotImplementedError(
+                "ffield with conq is only implemented for method='matinv'"
+            )
+        sign, lz = ffield_sign_lz(
+            positions, box, setup.ffield_electrode_mask, calculator.slab_axis
+        )
+        ffield_f = sign * positions[elec_idx, calculator.slab_axis] / lz
+        row_a, row_b = setup.ffield_const_rows
+        n_const = setup.constraint_matrix.shape[0]
+        ffield_c = jnp.zeros(n_const).at[row_a].set(1.0).at[row_b].set(-1.0)
+        efield = None  # determined by the solved potentials below
+    elif setup.ffield_electrode_mask is not None:
         chi_ffield, efield = finite_field_add_chi(
             positions,
             box,
@@ -475,12 +520,21 @@ def charge_optimization(
         return e_coul + jnp.sum(chi * q_e) + jnp.sum(hardness * q_e**2)
 
     if method == "matinv":
-        q_opt = matinv_optimize(
+        q_opt, lagmt = matinv_optimize(
             energy_electrode,
             chi,
             setup.constraint_matrix,
             setup.constraint_vals,
+            ffield_f=ffield_f,
+            ffield_c=ffield_c,
         )
+        if ffield_f is not None:
+            # potential of group g is -lambda_g
+            sign, lz = ffield_sign_lz(
+                positions, box, setup.ffield_electrode_mask, calculator.slab_axis
+            )
+            potential_drop = -jnp.sum(ffield_c * lagmt)
+            efield = -sign * potential_drop / lz
     else:
         q0 = vector_projection(
             charges[elec_idx], setup.constraint_matrix, setup.constraint_vals
@@ -521,25 +575,36 @@ def matinv_optimize(
     chi: jnp.ndarray,
     constraint_matrix: jnp.ndarray,
     constraint_vals: jnp.ndarray,
-) -> jnp.ndarray:
+    ffield_f: Optional[jnp.ndarray] = None,
+    ffield_c: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Solve the constrained quadratic minimization by matrix inversion of the
     KKT system [[H, A^T], [A, 0]] [q, lambda] = [-chi, b].
+
+    For conq finite-field mode the potential ramp adds a coupling of the
+    charges to the multipliers, replacing the upper-right block by
+    A^T - f c^T (the system is then no longer symmetric but still linear).
+
+    Returns the optimized charges and the Lagrange multipliers.
     """
     n = len(chi)
     hessian = calc_hessian(energy_fn, n)
     n_const = constraint_matrix.shape[0]
     if n_const == 0:
-        return jnp.linalg.solve(hessian, -chi)
+        return jnp.linalg.solve(hessian, -chi), jnp.zeros(0)
+    upper_right = constraint_matrix.T
+    if ffield_f is not None:
+        upper_right = upper_right - jnp.outer(ffield_f, ffield_c)
     coeff_matrix = jnp.block(
         [
-            [hessian, constraint_matrix.T],
+            [hessian, upper_right],
             [constraint_matrix, jnp.zeros((n_const, n_const))],
         ]
     )
     vector = jnp.concatenate([-chi, constraint_vals])
     solution = jnp.linalg.solve(coeff_matrix, vector)
-    return solution[:n]
+    return solution[:n], solution[n:]
 
 
 def pgrad_optimize(
